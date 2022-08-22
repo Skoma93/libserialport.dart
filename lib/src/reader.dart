@@ -122,7 +122,7 @@ class _SerialPortReaderImpl implements SerialPortReader {
       sendPort: _receiver!.sendPort,
     );
     Isolate.spawn(
-      _waitRead,
+      _readerIsolate,
       args,
       debugName: toString(),
     ).then((value) => _isolate = value);
@@ -136,21 +136,49 @@ class _SerialPortReaderImpl implements SerialPortReader {
   }
 
   static void _waitRead(_SerialPortReaderArgs args) {
-    final port = ffi.Pointer<sp_port>.fromAddress(args.address);
-    final events = _createEvents(port, _kReadEvents);
-    var bytes = 0;
-    while (bytes >= 0) {
-      bytes = _waitEvents(port, events, args.timeout);
-      if (bytes > 0) {
-        final data = Util.read(bytes, (ffi.Pointer<ffi.Uint8> ptr) {
-          return dylib.sp_nonblocking_read(port, ptr.cast(), bytes);
-        });
-        args.sendPort.send(data);
-      } else if (bytes < 0) {
-        args.sendPort.send(SerialPort.lastError);
+    SerialPort port = SerialPort.fromAddress(args.address);
+    while (port.isOpen) {
+      // Read a single byte. This is a blocking call which will timeout after args.timeout ms.
+      var first = port.read(1, timeout: args.timeout);
+      if (first.isNotEmpty) {
+        // Send the single byte
+        args.sendPort.send(first);
+        // Read the rest of the data available.
+        var toRead = port.bytesAvailable;
+        if (toRead > 0) {
+          var remaining = port.read(toRead);
+          if (remaining.isNotEmpty) {
+            args.sendPort.send(remaining);
+          }
+        }
       }
     }
-    _releaseEvents(events);
+  }
+
+  static void _readerIsolate(_SerialPortReaderArgs args) {
+    SerialPort port = SerialPort.fromAddress(args.address);
+    while (port.isOpen) {
+      // Read a single byte
+      var first = port.read(1, timeout: args.timeout);
+      if (first.isNotEmpty) {
+        var toRead = port.bytesAvailable;
+        if (toRead > 0) {
+          // Read the rest.
+          var remaining = port.read(toRead);
+          if (remaining.length == toRead) {
+            var data = Uint8List(toRead + 1);
+            data[0] = first[0];
+            data.setRange(1, toRead + 1, remaining);
+            args.sendPort.send(data);
+          } else {
+            args.sendPort.send(SerialPortError('Could not read all data.'));
+          }
+        } else {
+          // Send the single byte
+          args.sendPort.send(first);
+        }
+      }
+    }
   }
 
   static ffi.Pointer<ffi.Pointer<sp_event_set>> _createEvents(
